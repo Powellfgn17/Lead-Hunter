@@ -1,0 +1,10 @@
+[
+  {"name": "Charlotte NC", "country": "US"},
+  {"name": "Nashville TN", "country": "US"},
+  {"name": "Phoenix AZ", "country": "US"},
+  {"name": "Atlanta GA", "country": "US"},
+  {"name": "Birmingham UK", "country": "UK"},
+  {"name": "Manchester UK", "country": "UK"},
+  {"name": "Lyon France", "country": "FR"},
+  {"name": "Hamburg Germany", "country": "DE"}
+]
