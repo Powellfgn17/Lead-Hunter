@@ -1,46 +1,50 @@
 # 🎯 Lead Hunting Agent
 
-Autonomous Multi-Agent System built with [CrewAI](https://crewai.com/).
-It automatically finds local businesses without websites, enriches their data, scores them, and saves the qualified leads to a Supabase database.
+Un système multi-agents autonome conçu pour identifier, enrichir, valider et stocker des leads B2B (PME sans site web).
 
-## 🚀 How it works
+## Architecture
 
-1. **Searcher Agent:** Takes a city and niche, searches Google and Places API, finds businesses without websites.
-2. **Scraper Agent:** Opens a headless browser (Playwright), visits listings, extracts phone/email/socials, and double-verifies the absence of a website.
-3. **Validator Agent:** Scores the lead (1-10) based on recent reviews, contact info, and activity. Eliminates weak leads and saves the rest to Supabase.
+Le système utilise **CrewAI** pour orchestrer 3 agents :
+1. **Searcher** : Cherche sur Google et Google Places les businesses sans site web.
+2. **Scraper** : Visite les pages via Playwright (navigateur headless) pour extraire téléphones, emails, réseaux sociaux et confirmer l'absence de site web.
+3. **Validator** : Score les leads (1 à 10) selon des critères précis et sauvegarde les meilleurs (score >= 5) dans Supabase.
 
-## ⚙️ Installation
+## Prérequis
+
+- Python 3.11+
+- [LiteLLM](https://docs.litellm.ai/) & CrewAI
+- Playwright
+- Un projet [Supabase](https://supabase.com/)
+- Clés API : Groq (LLM), Serper.dev (Recherche web), Google Maps (Places API)
+
+## Installation
 
 ```bash
-# Create a virtual environment and install dependencies
-python3 -m venv venv
-source venv/bin/activate
+# Activer votre environnement virtuel
+source /chemin/vers/venv/bin/activate
+
+# Installer les dépendances
 pip install -r requirements.txt
+
+# Installer le navigateur Playwright
 playwright install chromium
 ```
 
-## 🔑 Configuration
+## Configuration
 
-Copy `.env.example` to `.env` and fill in your keys:
-- `GROQ_API_KEY` (LLM)
-- `SERPER_API_KEY` (Google Search)
-- `GOOGLE_MAPS_API_KEY` (Places API)
-- `SUPABASE_URL` & `SUPABASE_KEY` (Database)
+1. Copiez `.env.example` vers `.env`
+2. Remplissez vos clés API
+3. Créez la table dans Supabase en exécutant le script `supabase_schema.sql` dans le SQL Editor de votre projet Supabase.
 
-Execute `supabase_schema.sql` in your Supabase SQL Editor to create the tables.
-
-## 💻 Usage
+## Utilisation
 
 ```bash
-# List available cities and niches
+# Lister les villes et niches disponibles
 python main.py --list
 
-# Run a specific city and niche (Mock mode by default)
+# Mode Test (Mock) - Aucune clé API requise
 python main.py --city "Charlotte NC" --niche "barbershop"
 
-# Run in production (real API calls & DB inserts)
+# Mode Production - Utilise les vraies APIs
 python main.py --city "Charlotte NC" --niche "barbershop" --mode production
-
-# Run all niches for a city
-python main.py --city "Lyon France" --mode production
 ```
