@@ -4,11 +4,19 @@ Receives city + niche, searches Google and Places API,
 identifies businesses without websites, returns raw lead list.
 """
 
+from typing import List
 from crewai import Agent, Task
+from pydantic import BaseModel
 
 from config.settings import settings
 from tools.serper_tool import search_google
 from tools.places_tool import search_places, get_place_details
+from models.lead import RawLead
+
+
+class RawLeadList(BaseModel):
+    """Structured output wrapper for the Searcher task."""
+    leads: List[RawLead] = []
 
 
 def create_searcher_agent() -> Agent:
@@ -57,13 +65,16 @@ Return a JSON array of raw leads. Each lead must have:
 - phone: phone number if available
 - place_id: Google Place ID
 
-IMPORTANT: Output ONLY the JSON array, no additional text.
+IMPORTANT: Your entire response must be ONLY a valid JSON object matching this schema:
+{{"leads": [{{"name": "...", "maps_url": "...", "address": "...", "city": "{city}", "niche": "{niche}", "has_website": false, "phone": "...", "place_id": "..."}}]}}
+Do not add any text before or after the JSON.
 """,
         expected_output=(
-            'A JSON array of business objects without websites. Example:\n'
-            '[{{"name": "Business Name", "maps_url": "https://maps.google.com/...", '
+            'A JSON object with a "leads" array of business objects without websites. '
+            'Example: {{"leads": [{{"name": "Business Name", "maps_url": "https://maps.google.com/...", '
             '"address": "123 Main St", "city": "' + city + '", "niche": "' + niche + '", '
-            '"has_website": false, "phone": "+1 555-0000", "place_id": "ChIJ..."}}]'
+            '"has_website": false, "phone": "+1 555-0000", "place_id": "ChIJ..."}}]}}'
         ),
+        output_pydantic=RawLeadList,
         agent=agent,
     )

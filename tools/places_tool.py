@@ -121,7 +121,7 @@ MOCK_PLACE_DETAILS = {
 }
 
 
-# ─── Real API Implementation ──────────────────────────────
+# ─── Google API Implementation ──────────────────────────────
 
 PLACES_BASE_URL = "https://maps.googleapis.com/maps/api/place"
 
@@ -171,10 +171,66 @@ def _get_place_details_api(place_id: str) -> dict:
         response.raise_for_status()
         data = response.json()
 
-        if data.get("status") != "OK":
-            raise Exception(f"Place Details error: {data.get('status')}")
-
         return data.get("result", {})
+
+
+# ─── Serper Places API Implementation ──────────────────────
+
+SERPER_BASE_URL = "https://google.serper.dev/places"
+_SERPER_CACHE = {}  # Cache to avoid calling details if we already have it
+
+
+def _normalize_serper_to_google(place: dict) -> dict:
+    """Normalize Serper Places payload to match Google Maps format."""
+    cid = str(place.get("cid", ""))
+    return {
+        "place_id": cid,
+        "name": place.get("title", ""),
+        "formatted_address": place.get("address", ""),
+        "formatted_phone_number": place.get("phoneNumber", ""),
+        "website": place.get("website"),
+        "rating": float(place.get("rating", 0)) if place.get("rating") else 0.0,
+        "user_ratings_total": int(place.get("ratingCount", 0)) if place.get("ratingCount") else 0,
+        "url": place.get("link", f"https://maps.google.com/?cid={cid}"),
+        "business_status": "OPERATIONAL",
+        "types": [place.get("category", "")] if place.get("category") else [],
+        "reviews": [], # Serper basic search doesn't include reviews
+    }
+
+
+@retry(
+    stop=stop_after_attempt(settings.max_retries),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+)
+def _search_serper_places_api(query: str) -> list[dict]:
+    """Search using Serper's Places endpoint."""
+    headers = {
+        "X-API-KEY": settings.serper_api_key,
+        "Content-Type": "application/json"
+    }
+    payload = {"q": query}
+
+    with httpx.Client(timeout=30) as client:
+        response = client.post(SERPER_BASE_URL, headers=headers, json=payload)
+        response.raise_for_status()
+        data = response.json()
+        
+        normalized_results = []
+        for p in data.get("places", []):
+            normalized = _normalize_serper_to_google(p)
+            normalized_results.append(normalized)
+            # Store in cache so we don't need to fetch details later!
+            if normalized["place_id"]:
+                _SERPER_CACHE[normalized["place_id"]] = normalized
+                
+        return normalized_results
+
+
+def _get_serper_details_api(place_id: str) -> dict:
+    """Return place details from the Serper cache."""
+    # Since search_places already gets all the info we need (website, rating, phone),
+    # we just return it from our cache! Cost: 0 credit, 0 ms.
+    return _SERPER_CACHE.get(str(place_id), {"error": "Place not found in cache"})
 
 
 # ─── CrewAI Tools ──────────────────────────────────────────
@@ -200,10 +256,15 @@ def search_places(query: str) -> str:
     time.sleep(max(1.0, delay))
 
     try:
-        results = _search_places_api(query)
+        if settings.data_source == "serper":
+            results = _search_serper_places_api(query)
+        else:
+            results = _search_places_api(query)
+            
         return json.dumps({
             "query": query,
             "mock": False,
+            "source": settings.data_source,
             "results": results,
             "count": len(results),
         }, indent=2)
@@ -231,12 +292,20 @@ def get_place_details(place_id: str) -> str:
         })
         return json.dumps({"mock": True, "result": details}, indent=2)
 
-    # Rate limiting (mandatory 2s for Place Details)
+    # Rate limiting (mandatory delay)
     delay = settings.delay_between_requests + random.uniform(0, settings.delay_jitter)
     time.sleep(max(2.0, delay))
 
     try:
-        result = _get_place_details_api(place_id)
-        return json.dumps({"mock": False, "result": result}, indent=2)
+        if settings.data_source == "serper":
+            result = _get_serper_details_api(place_id)
+        else:
+            result = _get_place_details_api(place_id)
+            
+        return json.dumps({
+            "mock": False, 
+            "source": settings.data_source,
+            "result": result
+        }, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "place_id": place_id})

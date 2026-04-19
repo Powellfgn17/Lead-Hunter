@@ -5,10 +5,18 @@ extracts enriched data: phone, email, social, reviews, etc.
 Only passes along leads where has_website = false is CONFIRMED.
 """
 
+from typing import List
 from crewai import Agent, Task
+from pydantic import BaseModel
 
 from config.settings import settings
 from tools.playwright_tool import scrape_listing
+from models.lead import EnrichedLead
+
+
+class EnrichedLeadList(BaseModel):
+    """Structured output wrapper for the Scraper task."""
+    leads: List[EnrichedLead] = []
 
 
 def create_scraper_agent() -> Agent:
@@ -59,15 +67,18 @@ Return a JSON array of enriched leads. Each must have:
 
 IMPORTANT:
 - Do NOT include any lead where a website was found
-- Output ONLY the JSON array
+- Your entire response must be ONLY a valid JSON object:
+  {{"leads": [{{...enriched lead fields...}}]}}
+- Do not add any text before or after the JSON.
 """,
         expected_output=(
-            'A JSON array of enriched leads with confirmed no website. Example:\n'
-            '[{{"name": "Business", "address": "123 St", "phone": "+1 555-0000", '
-            '"email": "contact@email.com", "city": "' + city + '", "niche": "' + niche + '", '
+            'A JSON object with a "leads" array of enriched leads (no website confirmed). '
+            'Example: {{"leads": [{{"name": "Business", "address": "123 St", "phone": "+1 555-0000", '
+            '"email": "", "city": "' + city + '", "niche": "' + niche + '", '
             '"maps_url": "...", "has_website": false, "nb_avis": 50, "rating": 4.5, '
-            '"dernier_avis": "1 week ago", "reseaux_sociaux": {{"facebook": "..."}}, '
-            '"years_active": 3.0, "website_url": "", "place_id": "ChIJ..."}}]'
+            '"dernier_avis": "1 week ago", "reseaux_sociaux": {{}}, '
+            '"years_active": 3.0, "website_url": "", "place_id": "ChIJ..."}}]}}'
         ),
+        output_pydantic=EnrichedLeadList,
         agent=agent,
     )

@@ -20,6 +20,7 @@ class Settings:
 
     # --- Mode ---
     mode: str = os.getenv("MODE", "mock")
+    data_source: str = os.getenv("DATA_SOURCE", "serper")  # serper or google
 
     # --- API Keys ---
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
@@ -83,8 +84,10 @@ class Settings:
             missing.append("GROQ_API_KEY")
         if not self.serper_api_key:
             missing.append("SERPER_API_KEY")
-        if not self.google_maps_api_key:
+            
+        if self.data_source == "google" and not self.google_maps_api_key:
             missing.append("GOOGLE_MAPS_API_KEY")
+
         if not self.supabase_url:
             missing.append("SUPABASE_URL")
         if not self.supabase_key:

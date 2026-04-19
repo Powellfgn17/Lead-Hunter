@@ -4,10 +4,25 @@ Receives enriched leads, validates activity, confirms no website,
 scores each lead 1-10, eliminates weak leads, saves to Supabase.
 """
 
+from typing import List
 from crewai import Agent, Task
+from pydantic import BaseModel
 
 from config.settings import settings
 from tools.supabase_tool import upsert_leads, get_lead_count
+from models.lead import ScoredLead
+
+
+class ValidationSummary(BaseModel):
+    """Structured output for the Validator task."""
+    city: str = ""
+    niche: str = ""
+    total_received: int = 0
+    total_qualified: int = 0
+    total_rejected: int = 0
+    saved_to_db: int = 0
+    qualified_leads: List[ScoredLead] = []
+    rejected_leads: List[dict] = []
 
 
 SCORING_CRITERIA = """
@@ -106,11 +121,23 @@ Return a JSON summary:
   "rejected_leads": [array of rejected leads with rejection_reason]
 }}
 
-IMPORTANT: Output ONLY the JSON summary.
+IMPORTANT: Your entire response must be ONLY a valid JSON object matching this schema:
+{{
+  "city": "{city}",
+  "niche": "{niche}",
+  "total_received": <int>,
+  "total_qualified": <int>,
+  "total_rejected": <int>,
+  "saved_to_db": <int>,
+  "qualified_leads": [<ScoredLead objects>],
+  "rejected_leads": [{{"name": "...", "rejection_reason": "..."}}]
+}}
+Do not add any text before or after the JSON.
 """,
         expected_output=(
-            'A JSON summary object with qualified/rejected counts and lead arrays. '
+            'A JSON object summary with qualified/rejected counts and lead arrays. '
             'All qualified leads must have score >= 5 and be saved to database.'
         ),
+        output_pydantic=ValidationSummary,
         agent=agent,
     )
