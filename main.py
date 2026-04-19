@@ -33,6 +33,7 @@ from agents.scraper import create_scraper_agent, create_scrape_task
 from agents.validator import create_validator_agent, create_validate_task
 from utils.logger import get_logger
 from utils.export import export_csv, export_excel
+from utils.verifier import filter_verified_leads
 
 console = Console()
 log = get_logger("main")
@@ -233,6 +234,29 @@ def run_pipeline(city: str, niche: str) -> dict:
 
     # Always keep raw output for debugging
     summary["raw_output"] = raw_text
+
+    # ── Independent Verification (anti-hallucination) ──────
+    # Re-check each lead via Serper API directly — no LLM involved.
+    # This catches false positives where the model said "no website"
+    # but the business actually has one.
+    raw_leads = summary.get("leads", [])
+    if raw_leads and not settings.is_mock:
+        console.print("\n[bold yellow]🔍 Vérification indépendante des leads (anti-hallucination)...[/bold yellow]")
+        verified_leads, false_positives = filter_verified_leads(raw_leads)
+
+        if false_positives:
+            console.print(
+                f"[bold red]🚫 {len(false_positives)} faux positif(s) détecté(s) et éliminé(s):[/bold red]"
+            )
+            for fp in false_positives:
+                console.print(
+                    f"  ✗ [red]{fp.get('name', '?')}[/red] → {fp.get('verified_website', '?')}"
+                )
+
+        summary["leads"] = verified_leads
+        summary["qualified"] = len(verified_leads)
+        summary["false_positives"] = len(false_positives)
+        summary["false_positive_details"] = false_positives
 
     # ── Display summary ────────────────────────────────────
     qualified = summary.get('qualified', '?')
