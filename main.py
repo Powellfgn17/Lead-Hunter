@@ -13,11 +13,13 @@ Usage:
 
 import argparse
 import json
+import re
 import sys
 import time
 import os
 from datetime import datetime
 from itertools import product
+from pathlib import Path
 
 from rich.console import Console
 from rich.panel import Panel
@@ -29,8 +31,78 @@ from config.settings import settings
 from agents.searcher import create_searcher_agent, create_search_task
 from agents.scraper import create_scraper_agent, create_scrape_task
 from agents.validator import create_validator_agent, create_validate_task
+from utils.logger import get_logger
+from utils.export import export_csv, export_excel
 
 console = Console()
+log = get_logger("main")
+
+
+# ─── JSON Extraction Helper ────────────────────────────────
+
+def _extract_json(text: str):
+    """
+    Extract a JSON object or array from LLM output that may contain
+    surrounding natural language text. Tries multiple strategies:
+    1. Direct json.loads on the full text
+    2. Regex extraction of JSON objects {...} or arrays [...]
+    3. Returns None if nothing valid is found
+    """
+    if not text or not text.strip():
+        return None
+
+    raw = text.strip()
+
+    # Strategy 1: try direct parse
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        pass
+
+    # Strategy 2: find the largest JSON object or array in the text
+    # Look for JSON objects
+    best = None
+    for pattern in [
+        r'(\{[\s\S]*\})',   # JSON object (greedy)
+        r'(\[[\s\S]*\])',   # JSON array (greedy)
+    ]:
+        matches = re.findall(pattern, raw)
+        for match in matches:
+            try:
+                parsed = json.loads(match)
+                # Keep the largest valid JSON found
+                if best is None or len(match) > len(json.dumps(best)):
+                    best = parsed
+            except (json.JSONDecodeError, TypeError):
+                continue
+
+    return best
+
+
+def _extract_leads_from_output(text: str) -> list[dict]:
+    """
+    Extract individual lead dicts from LLM output, even if the output
+    is not a clean JSON summary. Looks for objects with 'nom' or 'name' keys.
+    """
+    parsed = _extract_json(text)
+    if parsed is None:
+        return []
+
+    # If it's a summary dict with qualified_leads
+    if isinstance(parsed, dict):
+        leads = parsed.get("qualified_leads", [])
+        if leads:
+            return leads
+        # Maybe it's a single lead
+        if "nom" in parsed or "name" in parsed:
+            return [parsed]
+        return []
+
+    # If it's an array of leads
+    if isinstance(parsed, list):
+        return [l for l in parsed if isinstance(l, dict)]  
+
+    return []
 
 
 # ─── CLI ───────────────────────────────────────────────────
@@ -132,35 +204,69 @@ def run_pipeline(city: str, niche: str) -> dict:
     duration = round(time.time() - start, 1)
 
     # ── Parse result ───────────────────────────────────────
+    raw_text = result.raw if hasattr(result, "raw") else str(result)
+
     summary = {
         "city": city,
         "niche": niche,
         "status": "completed",
         "duration": duration,
-        "raw_output": str(result),
     }
 
-    # Try to parse the validator's JSON output
-    try:
-        if hasattr(result, "raw"):
-            parsed = json.loads(result.raw)
-        else:
-            parsed = json.loads(str(result))
+    # Try to extract structured JSON from the LLM output
+    parsed = _extract_json(raw_text)
+
+    if isinstance(parsed, dict) and "total_qualified" in parsed:
+        # Clean summary format from validator
         summary["result"] = parsed
         summary["qualified"] = parsed.get("total_qualified", 0)
         summary["rejected"] = parsed.get("total_rejected", 0)
-    except (json.JSONDecodeError, TypeError):
-        summary["result"] = str(result)
-        summary["qualified"] = "unknown"
+        summary["leads"] = parsed.get("qualified_leads", [])
+    else:
+        # Fallback: extract any lead objects from the output
+        leads = _extract_leads_from_output(raw_text)
+        summary["qualified"] = len(leads)
+        summary["rejected"] = 0
+        summary["leads"] = leads
+        if parsed is not None:
+            summary["result"] = parsed
+
+    # Always keep raw output for debugging
+    summary["raw_output"] = raw_text
 
     # ── Display summary ────────────────────────────────────
+    qualified = summary.get('qualified', '?')
+    rejected = summary.get('rejected', '?')
+    leads_found = summary.get('leads', [])
+
     console.print(Panel(
         f"[bold white]⏱️  Duration:[/bold white] {duration}s\n"
-        f"[bold white]✅ Qualified:[/bold white] {summary.get('qualified', '?')}\n"
-        f"[bold white]❌ Rejected:[/bold white] {summary.get('rejected', '?')}",
+        f"[bold white]✅ Qualified:[/bold white] {qualified}\n"
+        f"[bold white]❌ Rejected:[/bold white] {rejected}\n"
+        f"[bold white]📋 Leads:[/bold white] {len(leads_found)} extracted",
         title=f"[bold green]✅ Completed: {city} × {niche}[/bold green]",
         border_style="green",
     ))
+
+    # Show leads table if any were found
+    if leads_found:
+        lead_table = Table(show_header=True, header_style="bold green")
+        lead_table.add_column("#", style="dim", width=3)
+        lead_table.add_column("Nom", style="white")
+        lead_table.add_column("Ville", style="cyan")
+        lead_table.add_column("Score", justify="right", style="bold yellow")
+        lead_table.add_column("Téléphone", style="dim")
+        lead_table.add_column("Email", style="dim")
+
+        for idx, lead in enumerate(leads_found, 1):
+            name = lead.get("nom", lead.get("name", "?"))
+            ville = lead.get("ville", lead.get("city", "?"))
+            score = str(lead.get("score", "?"))
+            phone = lead.get("telephone", lead.get("phone", ""))
+            email = lead.get("email", "")
+            lead_table.add_row(str(idx), name, ville, score, phone, email)
+
+        console.print(lead_table)
 
     return summary
 
@@ -262,12 +368,57 @@ def main():
 
     console.print(table)
 
-    # Save results to file
+    # Save results to results/ directory
+    results_dir = settings.project_root / "results"
+    results_dir.mkdir(exist_ok=True)
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = settings.project_root / f"results_{timestamp}.json"
-    with open(output_file, "w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2, default=str)
-    console.print(f"\n[dim]Results saved to {output_file}[/dim]\n")
+
+    # Save global summary (all runs)
+    summary_file = results_dir / f"run_{timestamp}.json"
+    # Strip raw_output from saved file to keep it clean
+    clean_results = []
+    for r in results:
+        clean = {k: v for k, v in r.items() if k != "raw_output"}
+        clean_results.append(clean)
+
+    with open(summary_file, "w", encoding="utf-8") as f:
+        json.dump(clean_results, f, indent=2, default=str, ensure_ascii=False)
+
+    # Save individual leads as a flat CSV-ready JSON
+    all_leads = []
+    for r in results:
+        for lead in r.get("leads", []):
+            lead["_run_city"] = r["city"]
+            lead["_run_niche"] = r["niche"]
+            lead["_run_timestamp"] = timestamp
+            all_leads.append(lead)
+
+    if all_leads:
+        # JSON
+        leads_file = results_dir / f"leads_{timestamp}.json"
+        with open(leads_file, "w", encoding="utf-8") as f:
+            json.dump(all_leads, f, indent=2, default=str, ensure_ascii=False)
+
+        # CSV
+        csv_file = export_csv(all_leads, results_dir / f"leads_{timestamp}.csv")
+
+        # Excel
+        xlsx_file = export_excel(all_leads, results_dir / f"leads_{timestamp}.xlsx")
+
+        console.print(f"\n[bold green]📁 {len(all_leads)} leads exportés :[/bold green]")
+        console.print(f"  [dim]JSON  → {leads_file}[/dim]")
+        console.print(f"  [dim]CSV   → {csv_file}[/dim]")
+        console.print(f"  [dim]Excel → {xlsx_file}[/dim]")
+
+        log.info(f"{len(all_leads)} leads exported to JSON/CSV/Excel in {results_dir}")
+    else:
+        console.print("\n[yellow]⚠️  Aucun lead qualifié à exporter.[/yellow]")
+
+    console.print(f"\n[dim]Run summary saved to {summary_file}[/dim]")
+    console.print(f"[dim]Dashboard : streamlit run dashboard.py[/dim]\n")
+
+    log.info(f"Run complete: {len(results)} pipelines, {len(all_leads)} total leads")
 
 
 if __name__ == "__main__":

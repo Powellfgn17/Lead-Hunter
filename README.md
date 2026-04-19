@@ -38,6 +38,8 @@ playwright install chromium
 
 ## Utilisation
 
+### Lancer une recherche
+
 ```bash
 # Lister les villes et niches disponibles
 python main.py --list
@@ -48,3 +50,21 @@ python main.py --city "Charlotte NC" --niche "barbershop"
 # Mode Production - Utilise les vraies APIs
 python main.py --city "Charlotte NC" --niche "barbershop" --mode production
 ```
+
+### Dashboard et Exports
+
+Le projet inclut désormais un dashboard Streamlit interactif pour visualiser, filtrer et exporter les leads (CSV, Excel avec code couleur, JSON).
+
+```bash
+# Lancer le dashboard interactif
+streamlit run dashboard.py
+```
+*Le dashboard sera accessible sur `http://localhost:8501`.*
+
+À chaque exécution réussie de `main.py`, les leads générés sont également exportés automatiquement dans le dossier `results/` sous plusieurs formats :
+- `leads_YYYYMMDD_HHMMSS.json`
+- `leads_YYYYMMDD_HHMMSS.csv`
+- `leads_YYYYMMDD_HHMMSS.xlsx`
+
+### Logs (Traçabilité)
+Un système de logs complet (`loguru`) est intégré. Les logs sont enregistrés et archivés (rotation) dans le dossier `logs/`.
