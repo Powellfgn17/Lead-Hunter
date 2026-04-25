@@ -56,8 +56,14 @@ CREATE OR REPLACE TRIGGER trigger_leads_updated_at
 -- Row Level Security (optionnel mais recommandé)
 ALTER TABLE leads ENABLE ROW LEVEL SECURITY;
 
--- Politique permettant toutes les opérations via service_role key
+-- IMPORTANT:
+-- Do NOT create permissive policies without scoping. This policy is intentionally
+-- restricted to the `service_role` database role (used by the Supabase service key).
+-- Postgres doesn't support CREATE POLICY IF NOT EXISTS, so we drop first to make reruns idempotent.
+DROP POLICY IF EXISTS "Service role full access" ON leads;
+
 CREATE POLICY "Service role full access" ON leads
   FOR ALL
+  TO service_role
   USING (true)
   WITH CHECK (true);

@@ -17,6 +17,7 @@ import re
 import sys
 import time
 import os
+import random
 from datetime import datetime
 from itertools import product
 from pathlib import Path
@@ -34,6 +35,12 @@ from agents.validator import create_validator_agent, create_validate_task
 from utils.logger import get_logger
 from utils.export import export_csv, export_excel
 from utils.verifier import filter_verified_leads
+from utils.lead_normalize import normalize_lead_keys
+from utils.lead_normalize import to_supabase_lead_dict
+
+from tools.places_tool import places_search_raw, place_details_raw
+from tools.playwright_tool import scrape_listing_raw
+from tools.supabase_tool import upsert_leads_raw
 
 console = Console()
 log = get_logger("main")
@@ -121,6 +128,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--list", action="store_true", help="List available cities and niches")
     parser.add_argument(
+        "--strategy",
+        type=str,
+        choices=["crewai", "tool-first"],
+        default=None,
+        help="Pipeline strategy: crewai (LLM-driven) or tool-first (deterministic, zero hallucination).",
+    )
+    parser.add_argument(
         "--all", action="store_true",
         help="Run all city×niche combinations (use with caution in production)"
     )
@@ -144,6 +158,305 @@ def show_config_list():
 
 
 # ─── Pipeline ─────────────────────────────────────────────
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _safe_json_loads(text: str) -> dict:
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"error": "invalid_json", "raw": text[:5000]}
+
+
+def _is_recent_review(dernier_avis: str) -> bool:
+    """
+    Heuristic: treat reviews within ~6 months as "recent".
+    Works with typical strings like "3 days ago", "1 week ago", "2 months ago".
+    """
+    if not isinstance(dernier_avis, str):
+        return False
+    s = dernier_avis.lower().strip()
+    if not s:
+        return False
+    if "day" in s or "days" in s or "week" in s or "weeks" in s:
+        return True
+    if "month" in s or "months" in s:
+        # If it says e.g. "7 months ago" consider it not recent.
+        m = re.search(r"(\d+)\s*month", s)
+        if m:
+            try:
+                return int(m.group(1)) <= 6
+            except ValueError:
+                return False
+        return True
+    return False
+
+
+def _score_lead_deterministic(lead: dict) -> tuple[int, dict]:
+    """
+    Deterministic scoring (no LLM) matching the Validator criteria.
+    """
+    breakdown = {}
+    score = 0
+
+    # Recent reviews
+    recent = _is_recent_review(lead.get("dernier_avis", ""))
+    breakdown["recent_reviews"] = 2 if recent else 0
+    score += breakdown["recent_reviews"]
+
+    # >10 reviews
+    nb_avis = lead.get("nb_avis", 0) or 0
+    more_10 = isinstance(nb_avis, (int, float)) and nb_avis > 10
+    breakdown["more_than_10_reviews"] = 1 if more_10 else 0
+    score += breakdown["more_than_10_reviews"]
+
+    # Phone
+    phone = (lead.get("phone") or lead.get("telephone") or "").strip()
+    breakdown["phone_available"] = 1 if phone else 0
+    score += breakdown["phone_available"]
+
+    # Email
+    email = (lead.get("email") or "").strip()
+    breakdown["email_available"] = 2 if email else 0
+    score += breakdown["email_available"]
+
+    # Socials
+    socials = lead.get("reseaux_sociaux", {}) or {}
+    breakdown["present_on_social_media"] = 1 if isinstance(socials, dict) and len(socials) > 0 else 0
+    score += breakdown["present_on_social_media"]
+
+    # No website (must be verified true)
+    verified_status = lead.get("verified_status")
+    no_website = verified_status == "no_website" or lead.get("verified") is True
+    breakdown["no_website"] = 2 if no_website else 0
+    score += breakdown["no_website"]
+
+    # Active > 1 year
+    years_active = lead.get("years_active", 0) or 0
+    active_1y = isinstance(years_active, (int, float)) and years_active >= 1.0
+    breakdown["business_active_more_than_1_year"] = 1 if active_1y else 0
+    score += breakdown["business_active_more_than_1_year"]
+
+    # Clamp to [1,10]
+    score = max(1, min(10, int(score)))
+    return score, breakdown
+
+
+def run_pipeline_tool_first(city: str, niche: str) -> dict:
+    """
+    ZERO HALLUCINATION / ZERO FALSE POSITIVE pipeline:
+    - Fetch deterministic data via tools (Serper/Places, Playwright)
+    - Filter no-website in code
+    - Verify independently (Serper). If cannot verify => reject (unknown)
+    - Score deterministically in code
+    - Save only verified leads to DB (bulk upsert)
+
+    Returns a single JSON-ready dict "deliverable" with status + evidence.
+    """
+    start_ms = _now_ms()
+    evidence = {"strategy": "tool-first", "timings_ms": {}, "counts": {}}
+    errors: list[dict] = []
+
+    console.print(Panel(
+        f"[bold white]🏙️  City:[/bold white] {city}\n"
+        f"[bold white]🏷️  Niche:[/bold white] {niche}\n"
+        f"[bold white]⚙️  Mode:[/bold white] {'🟡 MOCK' if settings.is_mock else '🟢 PRODUCTION'}\n"
+        f"[bold white]🧰 Strategy:[/bold white] TOOL-FIRST (zero hallucination)",
+        title="[bold cyan]🎯 Starting Lead Hunt[/bold cyan]",
+        border_style="cyan",
+    ))
+
+    # 1) Places search (deterministic)
+    t0 = _now_ms()
+    query = f"{niche} in {city}"
+    places_payload = places_search_raw(query)
+    evidence["timings_ms"]["places_search"] = _now_ms() - t0
+    if places_payload.get("error"):
+        return {
+            "city": city,
+            "niche": niche,
+            "status": "tool_error",
+            "duration": round((_now_ms() - start_ms) / 1000, 1),
+            "qualified": 0,
+            "rejected": 0,
+            "errors": [{"stage": "places_search", "error": places_payload.get("error"), "query": query}],
+            "evidence": evidence,
+            "leads": [],
+        }
+
+    results = places_payload.get("results", []) or []
+    evidence["counts"]["places_results_total"] = len(results)
+    evidence["counts"]["query"] = query
+    evidence["counts"]["places_source"] = places_payload.get("source") or places_payload.get("mock")
+
+    # 2) Fetch details and filter website == None/empty (in code)
+    t1 = _now_ms()
+    candidates: list[dict] = []
+    has_site = 0
+    details_errors = 0
+    for r in results:
+        place_id = str(r.get("place_id", "") or "")
+        if not place_id:
+            continue
+        details_payload = place_details_raw(place_id)
+        if details_payload.get("error"):
+            details_errors += 1
+            errors.append({"stage": "place_details", "place_id": place_id, "error": details_payload.get("error")})
+            continue
+        det = details_payload.get("result", {}) or {}
+        website = (det.get("website") or "").strip()
+        if website:
+            has_site += 1
+            continue
+
+        lead = {
+            "name": det.get("name", ""),
+            "address": det.get("formatted_address", ""),
+            "phone": det.get("formatted_phone_number", "") or "",
+            "city": city,
+            "niche": niche,
+            "maps_url": det.get("url", "") or f"https://maps.google.com/?cid={place_id}",
+            "place_id": place_id,
+            "has_website": False,
+            "website_url": "",
+            "rating": det.get("rating", 0.0) or 0.0,
+            "nb_avis": det.get("user_ratings_total", 0) or 0,
+            # dernier_avis/reseaux/email/years_active filled by scraping below if available
+            "dernier_avis": "",
+            "reseaux_sociaux": {},
+            "email": "",
+            "years_active": 0.0,
+            "source": "tool-first",
+        }
+        candidates.append(lead)
+
+    evidence["timings_ms"]["place_details_and_filter"] = _now_ms() - t1
+    evidence["counts"]["places_with_website"] = has_site
+    evidence["counts"]["candidates_no_website_from_places"] = len(candidates)
+    evidence["counts"]["place_details_errors"] = details_errors
+
+    if not candidates:
+        return {
+            "city": city,
+            "niche": niche,
+            "status": "no_results",
+            "duration": round((_now_ms() - start_ms) / 1000, 1),
+            "qualified": 0,
+            "rejected": 0,
+            "errors": errors,
+            "evidence": evidence,
+            "leads": [],
+        }
+
+    # 3) Optional enrichment via Playwright (deterministic tool)
+    t2 = _now_ms()
+    enriched: list[dict] = []
+    scrape_errors = 0
+    for lead in candidates:
+        maps_url = lead.get("maps_url", "")
+        place_id = lead.get("place_id", "")
+        scrape_payload = scrape_listing_raw(maps_url, place_id=place_id)
+        if scrape_payload.get("error"):
+            scrape_errors += 1
+            errors.append({"stage": "scrape_listing", "place_id": place_id, "error": scrape_payload.get("error")})
+            enriched.append(lead)
+            continue
+
+        # Merge safe fields (never trust "website" from scraper to accept a lead;
+        # verifier will be final authority)
+        lead["email"] = scrape_payload.get("email", "") or lead.get("email", "")
+        lead["phone"] = scrape_payload.get("phone", "") or lead.get("phone", "")
+        lead["reseaux_sociaux"] = scrape_payload.get("reseaux_sociaux", {}) or {}
+        lead["dernier_avis"] = scrape_payload.get("dernier_avis", "") or lead.get("dernier_avis", "")
+        lead["years_active"] = scrape_payload.get("years_active", 0.0) or 0.0
+        enriched.append(lead)
+
+    evidence["timings_ms"]["scrape_listing"] = _now_ms() - t2
+    evidence["counts"]["scrape_errors"] = scrape_errors
+
+    # 4) Independent verification (strict)
+    t3 = _now_ms()
+    verified, rejected = filter_verified_leads(enriched)
+    evidence["timings_ms"]["independent_verification"] = _now_ms() - t3
+    evidence["counts"]["verified"] = len(verified)
+    evidence["counts"]["rejected"] = len(rejected)
+
+    if not verified:
+        return {
+            "city": city,
+            "niche": niche,
+            "status": "no_results",
+            "duration": round((_now_ms() - start_ms) / 1000, 1),
+            "qualified": 0,
+            "rejected": len(rejected),
+            "errors": errors,
+            "evidence": evidence,
+            "false_positives": len(rejected),
+            "false_positive_details": rejected,
+            "leads": [],
+        }
+
+    # 5) Deterministic scoring + threshold
+    t4 = _now_ms()
+    scored: list[dict] = []
+    rejected_scoring: list[dict] = []
+    for lead in verified:
+        score, breakdown = _score_lead_deterministic(lead)
+        lead["score"] = score
+        lead["score_breakdown"] = breakdown
+        lead["statut"] = "nouveau"
+        if score >= settings.min_lead_score:
+            scored.append(lead)
+        else:
+            lead["rejection_reason"] = f"Score below threshold ({settings.min_lead_score})"
+            rejected_scoring.append(lead)
+
+    evidence["timings_ms"]["scoring"] = _now_ms() - t4
+    evidence["counts"]["scored_kept"] = len(scored)
+    evidence["counts"]["scored_rejected"] = len(rejected_scoring)
+
+    if not scored:
+        return {
+            "city": city,
+            "niche": niche,
+            "status": "no_results",
+            "duration": round((_now_ms() - start_ms) / 1000, 1),
+            "qualified": 0,
+            "rejected": len(rejected) + len(rejected_scoring),
+            "errors": errors,
+            "evidence": evidence,
+            "false_positives": len(rejected),
+            "false_positive_details": rejected + rejected_scoring,
+            "leads": [],
+        }
+
+    # 6) Save to DB (bulk upsert). Only after verification + scoring.
+    t5 = _now_ms()
+    # Pass english or french; tool will normalize/mapping itself now.
+    db_payload = json.dumps([to_supabase_lead_dict(l) for l in scored], ensure_ascii=False)
+    evidence["timings_ms"]["db_upsert"] = _now_ms() - t5
+    db_result = upsert_leads_raw([to_supabase_lead_dict(l) for l in scored])
+    if db_result.get("error"):
+        errors.append({"stage": "db_upsert", "error": db_result.get("error")})
+
+    duration_s = round((_now_ms() - start_ms) / 1000, 1)
+    return {
+        "city": city,
+        "niche": niche,
+        "status": "completed",
+        "duration": duration_s,
+        "qualified": len(scored),
+        "rejected": len(rejected) + len(rejected_scoring),
+        "errors": errors,
+        "evidence": evidence,
+        "db": db_result,
+        "leads": scored,
+        "false_positives": len(rejected),
+        "false_positive_details": rejected,
+    }
+
 
 def run_pipeline(city: str, niche: str) -> dict:
     """
@@ -283,10 +596,11 @@ def run_pipeline(city: str, niche: str) -> dict:
         lead_table.add_column("Email", style="dim")
 
         for idx, lead in enumerate(leads_found, 1):
-            name = lead.get("nom", lead.get("name", "?"))
-            ville = lead.get("ville", lead.get("city", "?"))
+            n = normalize_lead_keys(lead)
+            name = n.get("name", "?")
+            ville = n.get("city", "?")
             score = str(lead.get("score", "?"))
-            phone = lead.get("telephone", lead.get("phone", ""))
+            phone = lead.get("telephone", lead.get("phone", "")) or n.get("phone", "")
             email = lead.get("email", "")
             lead_table.add_row(str(idx), name, ville, score, phone, email)
 
@@ -326,7 +640,9 @@ def main():
         console.print("[dim]Copy .env.example to .env and fill in your keys.[/dim]\n")
         sys.exit(1)
 
+    strategy = args.strategy or ("tool-first" if not settings.is_mock else "crewai")
     console.print(f"\n[dim]Mode: {'🟡 MOCK (no real API calls)' if settings.is_mock else '🟢 PRODUCTION'}[/dim]")
+    console.print(f"[dim]Strategy: {strategy}[/dim]")
 
     # Determine which city/niche combinations to run
     if args.all:
@@ -359,7 +675,10 @@ def main():
         console.print(f"[bold cyan]  Run {i}/{total}[/bold cyan]")
         console.print(f"[bold]{'='*60}[/bold]")
 
-        summary = run_pipeline(city, niche)
+        if strategy == "tool-first":
+            summary = run_pipeline_tool_first(city, niche)
+        else:
+            summary = run_pipeline(city, niche)
         results.append(summary)
 
         # Brief pause between runs to avoid rate limits

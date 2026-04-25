@@ -9,6 +9,7 @@ from typing import Optional
 
 from crewai.tools import tool
 from config.settings import settings
+from utils.lead_normalize import to_supabase_lead_dict
 
 
 # ─── Mock storage (in-memory for testing) ──────────────────
@@ -20,17 +21,18 @@ def _mock_upsert(leads: list[dict]) -> dict:
     """Simulate upsert in memory."""
     inserted, updated = 0, 0
     for lead in leads:
-        key = (lead.get("nom", ""), lead.get("adresse", ""))
+        normalized = to_supabase_lead_dict(lead)
+        key = (normalized.get("nom", ""), normalized.get("adresse", ""))
         existing = next(
             (i for i, l in enumerate(_mock_db)
              if (l.get("nom"), l.get("adresse")) == key),
             None
         )
         if existing is not None:
-            _mock_db[existing] = lead
+            _mock_db[existing] = normalized
             updated += 1
         else:
-            _mock_db.append(lead)
+            _mock_db.append(normalized)
             inserted += 1
     return {"inserted": inserted, "updated": updated, "total": len(_mock_db)}
 
@@ -54,41 +56,48 @@ def _get_client():
 
 
 def _real_upsert(leads: list[dict]) -> dict:
-    """Upsert leads into Supabase with conflict resolution on (nom, adresse)."""
+    """Bulk upsert leads into Supabase with conflict resolution on (nom, adresse)."""
     client = _get_client()
-    inserted, updated, errors = 0, 0, []
+    errors: list[dict] = []
 
+    payload = []
     for lead in leads:
         try:
-            # Check if exists
-            existing = (
-                client.table("leads")
-                .select("id")
-                .eq("nom", lead["nom"])
-                .eq("adresse", lead["adresse"])
-                .execute()
-            )
-
-            if existing.data:
-                # Update existing
-                client.table("leads").update(lead).eq(
-                    "id", existing.data[0]["id"]
-                ).execute()
-                updated += 1
-            else:
-                # Insert new
-                client.table("leads").insert(lead).execute()
-                inserted += 1
-
+            normalized = to_supabase_lead_dict(lead)
+            # Minimal validation for conflict keys
+            if not normalized.get("nom") or not normalized.get("adresse"):
+                raise ValueError("Missing required fields for upsert: nom/adresse")
+            payload.append(normalized)
         except Exception as e:
-            errors.append({"lead": lead.get("nom", "?"), "error": str(e)})
+            errors.append({"lead": str(lead.get("name") or lead.get("nom") or "?"), "error": str(e)})
+
+    if not payload:
+        return {"upserted": 0, "errors": errors, "total_in_db": _real_count()}
+
+    try:
+        # supabase-py supports bulk upsert with on_conflict.
+        # We rely on the UNIQUE(nom, adresse) constraint declared in supabase_schema.sql.
+        client.table("leads").upsert(payload, on_conflict="nom,adresse").execute()
+    except Exception as e:
+        return {"error": str(e), "upserted": 0, "errors": errors, "total_in_db": _real_count()}
 
     return {
-        "inserted": inserted,
-        "updated": updated,
+        "upserted": len(payload),
         "errors": errors,
         "total_in_db": _real_count(),
     }
+
+
+def upsert_leads_raw(leads: list[dict]) -> dict:
+    """Callable version of upsert (not a CrewAI tool)."""
+    if not leads:
+        return {"upserted": 0, "errors": [], "total_in_db": (_mock_count() if settings.is_mock else _real_count())}
+    if settings.is_mock:
+        time.sleep(0.3)
+        result = _mock_upsert(leads)
+        result["mock"] = True
+        return result
+    return _real_upsert(leads)
 
 
 def _real_count(city: str = "", niche: str = "") -> int:

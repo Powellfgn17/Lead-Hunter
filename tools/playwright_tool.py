@@ -122,14 +122,29 @@ def scrape_listing(url: str, place_id: str = "") -> str:
     time.sleep(max(2.0, delay))
 
     try:
-        import asyncio
-        try:
-            result = asyncio.run(_scrape_page(url))
-        except RuntimeError:
-            loop = asyncio.new_event_loop()
-            result = loop.run_until_complete(_scrape_page(url))
-            loop.close()
-        result["mock"] = False
-        return json.dumps(result, indent=2)
+        payload = scrape_listing_raw(url, place_id=place_id)
+        return json.dumps(payload, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "url": url})
+
+
+def scrape_listing_raw(url: str, place_id: str = "") -> dict:
+    """Callable version of scrape_listing (not a CrewAI tool)."""
+    if settings.is_mock:
+        time.sleep(0.5)
+        data = MOCK_SCRAPE.get(place_id, MOCK_DEFAULT).copy()
+        data.update({"url": url, "mock": True})
+        return data
+
+    delay = settings.delay_between_requests + random.uniform(0, settings.delay_jitter * 2)
+    time.sleep(max(2.0, delay))
+
+    import asyncio
+    try:
+        result = asyncio.run(_scrape_page(url))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        result = loop.run_until_complete(_scrape_page(url))
+        loop.close()
+    result["mock"] = False
+    return result

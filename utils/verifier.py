@@ -7,6 +7,7 @@ website status before it is saved to the database.
 import json
 import httpx
 from utils.logger import get_logger
+from utils.lead_normalize import normalize_lead_keys
 from config.settings import settings
 
 log = get_logger("verifier")
@@ -56,18 +57,22 @@ def verify_no_website(lead: dict) -> dict:
         lead["verified_website"] = ""
         return lead
 
-    name = lead.get("name", "")
-    city = lead.get("city", "")
+    normalized = normalize_lead_keys(lead)
+    name = normalized.get("name", "")
+    city = normalized.get("city", "")
 
     log.info(f"🔍 Verifying: {name} ({city})")
 
     place = _serper_search(name, city)
 
     if place is None:
-        # Cannot verify — Serper found nothing. Keep lead but mark as unverified.
-        log.warning(f"⚠️  Cannot verify '{name}' — not found in Serper. Keeping lead.")
-        lead["verified"] = True  # Give benefit of the doubt
+        # ZERO FALSE POSITIVE MODE:
+        # If we cannot verify deterministically, we reject (treat as unknown).
+        log.warning(f"⚠️  Cannot verify '{name}' — not found in Serper. Rejecting (unknown).")
+        lead["verified"] = False
+        lead["verified_status"] = "unknown"
         lead["verified_website"] = ""
+        lead["rejection_reason"] = "Independent verification failed (not found in Serper)."
         return lead
 
     website = place.get("website", None) or ""
@@ -77,6 +82,7 @@ def verify_no_website(lead: dict) -> dict:
         # WEBSITE FOUND — this is a false positive from the LLM
         log.warning(f"❌ False positive detected: '{name}' has website → {website}")
         lead["verified"] = False
+        lead["verified_status"] = "has_website"
         lead["verified_website"] = website
         lead["has_website"] = True
         lead["rejection_reason"] = f"Website found by independent verification: {website}"
@@ -84,6 +90,7 @@ def verify_no_website(lead: dict) -> dict:
         # Confirmed no website
         log.info(f"✅ Verified: '{name}' has NO website")
         lead["verified"] = True
+        lead["verified_status"] = "no_website"
         lead["verified_website"] = ""
 
     return lead

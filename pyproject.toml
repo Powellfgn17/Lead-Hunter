@@ -1,0 +1,9 @@
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+# Minimal, high-signal linting to avoid noisy refactors.
+# F: pyflakes (undefined names, unused imports, etc.)
+# E9: syntax errors
+select = ["F", "E9"]
+

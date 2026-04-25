@@ -256,18 +256,8 @@ def search_places(query: str) -> str:
     time.sleep(max(1.0, delay))
 
     try:
-        if settings.data_source == "serper":
-            results = _search_serper_places_api(query)
-        else:
-            results = _search_places_api(query)
-            
-        return json.dumps({
-            "query": query,
-            "mock": False,
-            "source": settings.data_source,
-            "results": results,
-            "count": len(results),
-        }, indent=2)
+        payload = places_search_raw(query)
+        return json.dumps(payload, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "query": query})
 
@@ -297,15 +287,63 @@ def get_place_details(place_id: str) -> str:
     time.sleep(max(2.0, delay))
 
     try:
-        if settings.data_source == "serper":
-            result = _get_serper_details_api(place_id)
-        else:
-            result = _get_place_details_api(place_id)
-            
-        return json.dumps({
-            "mock": False, 
-            "source": settings.data_source,
-            "result": result
-        }, indent=2)
+        payload = place_details_raw(place_id)
+        return json.dumps(payload, indent=2)
     except Exception as e:
         return json.dumps({"error": str(e), "place_id": place_id})
+
+
+# ─── Raw (callable) API for tool-first pipelines ───────────
+
+def places_search_raw(query: str) -> dict:
+    """Callable version of Places search (not a CrewAI tool)."""
+    if settings.is_mock:
+        time.sleep(0.3)
+        return {
+            "query": query,
+            "mock": True,
+            "results": MOCK_PLACES_SEARCH,
+            "count": len(MOCK_PLACES_SEARCH),
+        }
+
+    delay = settings.delay_between_requests + random.uniform(0, settings.delay_jitter)
+    time.sleep(max(1.0, delay))
+
+    if settings.data_source == "serper":
+        results = _search_serper_places_api(query)
+    else:
+        results = _search_places_api(query)
+
+    return {
+        "query": query,
+        "mock": False,
+        "source": settings.data_source,
+        "results": results,
+        "count": len(results),
+    }
+
+
+def place_details_raw(place_id: str) -> dict:
+    """Callable version of Place details (not a CrewAI tool)."""
+    if settings.is_mock:
+        time.sleep(0.2)
+        details = MOCK_PLACE_DETAILS.get(place_id, {
+            "place_id": place_id,
+            "name": f"Mock Business {place_id[-3:]}",
+            "formatted_address": "Unknown Address",
+            "website": None,
+            "rating": 4.0,
+            "user_ratings_total": 20,
+            "business_status": "OPERATIONAL",
+        })
+        return {"mock": True, "result": details}
+
+    delay = settings.delay_between_requests + random.uniform(0, settings.delay_jitter)
+    time.sleep(max(2.0, delay))
+
+    if settings.data_source == "serper":
+        result = _get_serper_details_api(place_id)
+    else:
+        result = _get_place_details_api(place_id)
+
+    return {"mock": False, "source": settings.data_source, "result": result}
