@@ -72,32 +72,50 @@ def _real_upsert(leads: list[dict]) -> dict:
             errors.append({"lead": str(lead.get("name") or lead.get("nom") or "?"), "error": str(e)})
 
     if not payload:
-        return {"upserted": 0, "errors": errors, "total_in_db": _real_count()}
+        total_count, count_error = _real_count_safe()
+        result = {"upserted": 0, "errors": errors, "total_in_db": total_count}
+        if count_error:
+            result["count_error"] = count_error
+        return result
 
     try:
         # supabase-py supports bulk upsert with on_conflict.
         # We rely on the UNIQUE(nom, adresse) constraint declared in supabase_schema.sql.
         client.table("leads").upsert(payload, on_conflict="nom,adresse").execute()
     except Exception as e:
-        return {"error": str(e), "upserted": 0, "errors": errors, "total_in_db": _real_count()}
+        # IMPORTANT: avoid calling _real_count() here, because the same backend issue
+        # (e.g. PGRST002 schema cache) can fail again and crash the whole run.
+        return {"error": str(e), "upserted": 0, "errors": errors, "total_in_db": None}
 
+    total_count, count_error = _real_count_safe()
     return {
         "upserted": len(payload),
         "errors": errors,
-        "total_in_db": _real_count(),
+        "total_in_db": total_count,
+        **({"count_error": count_error} if count_error else {}),
     }
 
 
 def upsert_leads_raw(leads: list[dict]) -> dict:
     """Callable version of upsert (not a CrewAI tool)."""
     if not leads:
-        return {"upserted": 0, "errors": [], "total_in_db": (_mock_count() if settings.is_mock else _real_count())}
+        if settings.is_mock:
+            return {"upserted": 0, "errors": [], "total_in_db": _mock_count()}
+        total_count, count_error = _real_count_safe()
+        result = {"upserted": 0, "errors": [], "total_in_db": total_count}
+        if count_error:
+            result["count_error"] = count_error
+        return result
     if settings.is_mock:
         time.sleep(0.3)
         result = _mock_upsert(leads)
         result["mock"] = True
         return result
-    return _real_upsert(leads)
+    try:
+        return _real_upsert(leads)
+    except Exception as e:
+        # Hard safety net: never crash caller on DB outages/transient API errors.
+        return {"error": str(e), "upserted": 0, "errors": [], "total_in_db": None}
 
 
 def _real_count(city: str = "", niche: str = "") -> int:
@@ -110,6 +128,14 @@ def _real_count(city: str = "", niche: str = "") -> int:
         query = query.eq("niche", niche)
     result = query.execute()
     return result.count or 0
+
+
+def _real_count_safe(city: str = "", niche: str = "") -> tuple[Optional[int], Optional[str]]:
+    """Safe count wrapper that never raises."""
+    try:
+        return _real_count(city, niche), None
+    except Exception as e:
+        return None, str(e)
 
 
 # ─── CrewAI Tools ──────────────────────────────────────────

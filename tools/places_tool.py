@@ -183,15 +183,16 @@ _SERPER_CACHE = {}  # Cache to avoid calling details if we already have it
 def _normalize_serper_to_google(place: dict) -> dict:
     """Normalize Serper Places payload to match Google Maps format."""
     cid = str(place.get("cid", ""))
+    place_id = str(place.get("placeId", "") or cid)
     return {
-        "place_id": cid,
+        "place_id": place_id,
         "name": place.get("title", ""),
         "formatted_address": place.get("address", ""),
         "formatted_phone_number": place.get("phoneNumber", ""),
         "website": place.get("website"),
         "rating": float(place.get("rating", 0)) if place.get("rating") else 0.0,
         "user_ratings_total": int(place.get("ratingCount", 0)) if place.get("ratingCount") else 0,
-        "url": place.get("link", f"https://maps.google.com/?cid={cid}"),
+        "url": place.get("link", f"https://maps.google.com/?cid={cid}" if cid else ""),
         "business_status": "OPERATIONAL",
         "types": [place.get("category", "")] if place.get("category") else [],
         "reviews": [], # Serper basic search doesn't include reviews

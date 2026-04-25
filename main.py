@@ -34,7 +34,7 @@ from agents.scraper import create_scraper_agent, create_scrape_task
 from agents.validator import create_validator_agent, create_validate_task
 from utils.logger import get_logger
 from utils.export import export_csv, export_excel
-from utils.verifier import filter_verified_leads
+from utils.verifier import is_business_website
 from utils.lead_normalize import normalize_lead_keys
 from utils.lead_normalize import to_supabase_lead_dict
 
@@ -295,6 +295,7 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
     t1 = _now_ms()
     candidates: list[dict] = []
     has_site = 0
+    non_business_website = 0
     details_errors = 0
     for r in results:
         place_id = str(r.get("place_id", "") or "")
@@ -306,10 +307,17 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
             errors.append({"stage": "place_details", "place_id": place_id, "error": details_payload.get("error")})
             continue
         det = details_payload.get("result", {}) or {}
-        website = (det.get("website") or "").strip()
-        if website:
+        if isinstance(det, dict) and det.get("error"):
+            details_errors += 1
+            errors.append({"stage": "place_details", "place_id": place_id, "error": det.get("error")})
+            continue
+
+        website = (det.get("website") or r.get("website") or "").strip()
+        if is_business_website(website):
             has_site += 1
             continue
+        if website:
+            non_business_website += 1
 
         lead = {
             "name": det.get("name", ""),
@@ -334,6 +342,7 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
 
     evidence["timings_ms"]["place_details_and_filter"] = _now_ms() - t1
     evidence["counts"]["places_with_website"] = has_site
+    evidence["counts"]["places_with_non_business_website"] = non_business_website
     evidence["counts"]["candidates_no_website_from_places"] = len(candidates)
     evidence["counts"]["place_details_errors"] = details_errors
 
@@ -350,9 +359,11 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
             "leads": [],
         }
 
-    # 3) Optional enrichment via Playwright (deterministic tool)
+    # 3) Playwright verification (source of truth)
+    # Serper is discovery-only. Truth about website comes from Maps scraping.
     t2 = _now_ms()
-    enriched: list[dict] = []
+    verified: list[dict] = []
+    rejected_truth: list[dict] = []
     scrape_errors = 0
     for lead in candidates:
         maps_url = lead.get("maps_url", "")
@@ -361,27 +372,43 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
         if scrape_payload.get("error"):
             scrape_errors += 1
             errors.append({"stage": "scrape_listing", "place_id": place_id, "error": scrape_payload.get("error")})
-            enriched.append(lead)
+            # ZERO FALSE POSITIVE rule:
+            # if truth source fails, status is unknown and lead is rejected.
+            lead["verified"] = False
+            lead["verified_status"] = "unknown"
+            lead["verified_website"] = ""
+            lead["rejection_reason"] = "Playwright verification failed (unknown website status)"
+            rejected_truth.append(lead)
             continue
 
-        # Merge safe fields (never trust "website" from scraper to accept a lead;
-        # verifier will be final authority)
+        # Merge enrichment fields
         lead["email"] = scrape_payload.get("email", "") or lead.get("email", "")
         lead["phone"] = scrape_payload.get("phone", "") or lead.get("phone", "")
         lead["reseaux_sociaux"] = scrape_payload.get("reseaux_sociaux", {}) or {}
         lead["dernier_avis"] = scrape_payload.get("dernier_avis", "") or lead.get("dernier_avis", "")
         lead["years_active"] = scrape_payload.get("years_active", 0.0) or 0.0
-        enriched.append(lead)
+
+        website_candidate = (scrape_payload.get("website") or "").strip()
+        if is_business_website(website_candidate):
+            lead["verified"] = False
+            lead["verified_status"] = "has_website"
+            lead["verified_website"] = website_candidate
+            lead["has_website"] = True
+            lead["rejection_reason"] = f"Website found by Playwright verification: {website_candidate}"
+            rejected_truth.append(lead)
+        else:
+            lead["verified"] = True
+            lead["verified_status"] = "no_website"
+            lead["verified_website"] = ""
+            verified.append(lead)
 
     evidence["timings_ms"]["scrape_listing"] = _now_ms() - t2
     evidence["counts"]["scrape_errors"] = scrape_errors
 
-    # 4) Independent verification (strict)
-    t3 = _now_ms()
-    verified, rejected = filter_verified_leads(enriched)
-    evidence["timings_ms"]["independent_verification"] = _now_ms() - t3
+    # 4) Truth decision summary (from Playwright)
+    evidence["timings_ms"]["independent_verification"] = 0
     evidence["counts"]["verified"] = len(verified)
-    evidence["counts"]["rejected"] = len(rejected)
+    evidence["counts"]["rejected"] = len(rejected_truth)
 
     if not verified:
         return {
@@ -390,11 +417,11 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
             "status": "no_results",
             "duration": round((_now_ms() - start_ms) / 1000, 1),
             "qualified": 0,
-            "rejected": len(rejected),
+            "rejected": len(rejected_truth),
             "errors": errors,
             "evidence": evidence,
-            "false_positives": len(rejected),
-            "false_positive_details": rejected,
+            "false_positives": len(rejected_truth),
+            "false_positive_details": rejected_truth,
             "leads": [],
         }
 
@@ -424,18 +451,16 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
             "status": "no_results",
             "duration": round((_now_ms() - start_ms) / 1000, 1),
             "qualified": 0,
-            "rejected": len(rejected) + len(rejected_scoring),
+            "rejected": len(rejected_truth) + len(rejected_scoring),
             "errors": errors,
             "evidence": evidence,
-            "false_positives": len(rejected),
-            "false_positive_details": rejected + rejected_scoring,
+            "false_positives": len(rejected_truth),
+            "false_positive_details": rejected_truth + rejected_scoring,
             "leads": [],
         }
 
     # 6) Save to DB (bulk upsert). Only after verification + scoring.
     t5 = _now_ms()
-    # Pass english or french; tool will normalize/mapping itself now.
-    db_payload = json.dumps([to_supabase_lead_dict(l) for l in scored], ensure_ascii=False)
     evidence["timings_ms"]["db_upsert"] = _now_ms() - t5
     db_result = upsert_leads_raw([to_supabase_lead_dict(l) for l in scored])
     if db_result.get("error"):
@@ -448,13 +473,13 @@ def run_pipeline_tool_first(city: str, niche: str) -> dict:
         "status": "completed",
         "duration": duration_s,
         "qualified": len(scored),
-        "rejected": len(rejected) + len(rejected_scoring),
+        "rejected": len(rejected_truth) + len(rejected_scoring),
         "errors": errors,
         "evidence": evidence,
         "db": db_result,
         "leads": scored,
-        "false_positives": len(rejected),
-        "false_positive_details": rejected,
+        "false_positives": len(rejected_truth),
+        "false_positive_details": rejected_truth,
     }
 
 

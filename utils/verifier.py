@@ -6,6 +6,7 @@ website status before it is saved to the database.
 
 import json
 import httpx
+from urllib.parse import urlparse
 from utils.logger import get_logger
 from utils.lead_normalize import normalize_lead_keys
 from config.settings import settings
@@ -13,6 +14,43 @@ from config.settings import settings
 log = get_logger("verifier")
 
 SERPER_PLACES_URL = "https://google.serper.dev/places"
+NON_BUSINESS_WEBSITE_HOSTS = {
+    "google.com",
+    "www.google.com",
+    "maps.google.com",
+    "facebook.com",
+    "www.facebook.com",
+    "instagram.com",
+    "www.instagram.com",
+    "yelp.com",
+    "www.yelp.com",
+    "tripadvisor.com",
+    "www.tripadvisor.com",
+}
+
+
+def is_business_website(url: str) -> bool:
+    """
+    True only for likely official business websites.
+    Excludes common aggregator/social/search hosts that create false positives.
+    """
+    if not isinstance(url, str) or not url.strip():
+        return False
+    raw = url.strip()
+    try:
+        parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    except Exception:
+        return False
+
+    host = (parsed.netloc or "").lower()
+    if not host:
+        return False
+    if host in NON_BUSINESS_WEBSITE_HOSTS:
+        return False
+    # Exclude Google wrappers like /searchviewer, /maps/reserve, etc.
+    if host.endswith("google.com"):
+        return False
+    return True
 
 
 def _serper_search(business_name: str, city: str) -> dict | None:
@@ -75,10 +113,9 @@ def verify_no_website(lead: dict) -> dict:
         lead["rejection_reason"] = "Independent verification failed (not found in Serper)."
         return lead
 
-    website = place.get("website", None) or ""
-    website = website.strip()
+    website = (place.get("website", None) or "").strip()
 
-    if website:
+    if is_business_website(website):
         # WEBSITE FOUND — this is a false positive from the LLM
         log.warning(f"❌ False positive detected: '{name}' has website → {website}")
         lead["verified"] = False
@@ -91,7 +128,7 @@ def verify_no_website(lead: dict) -> dict:
         log.info(f"✅ Verified: '{name}' has NO website")
         lead["verified"] = True
         lead["verified_status"] = "no_website"
-        lead["verified_website"] = ""
+        lead["verified_website"] = website if website and not is_business_website(website) else ""
 
     return lead
 
